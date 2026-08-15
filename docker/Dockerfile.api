@@ -1,23 +1,40 @@
-# Multi-arch base (Feature 1 edge case: arm64 vs x86_64 Docker base images)
+# Base image (Feature 1 edge case: arm64 vs x86_64 Docker base images —
+# `python:3.11-slim` publishes both, so no explicit `--platform` pin is
+# needed here). Deliberately NOT `FROM --platform=$BUILDPLATFORM ...`: that
+# BuildKit-only feature (forcing the builder stage to always build natively
+# on the host platform, only cross-compiling the final stage) silently
+# breaks under Cloud Build's classic builder — the very first thing Cloud
+# Build failed on when deploying this image via `gcloud run deploy
+# --source`, before even reaching the CA-bundle issue documented below.
+# Dropping it costs a little local build speed on Apple Silicon (the
+# builder stage no longer forces native-arch build when cross-compiling for
+# linux/amd64) but is correctness-neutral and portable to any builder.
 #
 # Hardened for production (see deploy/README.md):
 #   - multi-stage build: build toolchain / pip cache never lands in the final
 #     image, only the installed site-packages + app source do.
 #   - the corporate CA bundle (docker/ca-bundle.pem) is trusted in the
-#     builder stage ONLY IF PRESENT (see the `ca-bundle.p[e]m` glob COPY
-#     below — a live, reproduced regression: on a corporate-network dev
+#     builder stage ONLY IF PRESENT (see the `COPY docker/` + conditional
+#     `RUN` below — a live, reproduced regression: on a corporate-network dev
 #     machine, Docker's own build-time network egress goes through the same
 #     TLS-intercepting proxy `pip install` needs this bundle for, even
 #     though the host machine's own non-Docker network path does not; a
 #     real cloud build (Cloud Build, a GCE VM building the image directly,
 #     GitHub Actions, etc.) has no such proxy, and the file is
-#     gitignored/machine-local so it's simply absent there — the glob COPY
-#     is a no-op and this step trusts nothing extra) — never baked into the
-#     final image either way.
+#     gitignored/machine-local so it's simply absent there — this step then
+#     trusts nothing extra) — never baked into the final image either way.
+#     Deliberately NOT a bare `COPY docker/ca-bundle.p[e]m` glob on the
+#     possibly-absent file itself: a glob matching zero files only no-ops
+#     under Docker BuildKit, and hard-fails ("no source files were
+#     specified") under the classic/legacy builder — which is what Cloud
+#     Build's `gcr.io/cloud-builders/docker` step uses by default, confirmed
+#     live deploying this image via `gcloud run deploy --source`. Copying
+#     the always-present `docker/` directory and checking inside it works
+#     under both builders.
 #   - runs as a non-root `nightshift` user.
 #   - HEALTHCHECK hits the app's existing GET /health (see app/main.py).
 
-FROM --platform=$BUILDPLATFORM python:3.11-slim AS builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /srv/core_api
 
@@ -31,14 +48,16 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends build-essential ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Optional corporate CA bundle — the `p[e]m` glob makes this a no-op COPY
-# when the file doesn't exist (a real cloud/CI build) rather than a hard
-# build failure, per this file's own header comment.
-COPY docker/ca-bundle.p[e]m /tmp/corporate-ca.pem
-RUN if [ -f /tmp/corporate-ca.pem ]; then \
-      cp /tmp/corporate-ca.pem /usr/local/share/ca-certificates/corporate-ca.crt && \
+# Optional corporate CA bundle — copies the whole `docker/` directory
+# (which always exists) rather than a bare glob on the possibly-absent
+# `ca-bundle.pem` file itself, so this step behaves identically whether the
+# file exists or not, on any builder (see this file's own header comment).
+COPY docker/ /tmp/docker-ctx/
+RUN if [ -f /tmp/docker-ctx/ca-bundle.pem ]; then \
+      cp /tmp/docker-ctx/ca-bundle.pem /usr/local/share/ca-certificates/corporate-ca.crt && \
       update-ca-certificates; \
-    fi
+    fi && \
+    rm -rf /tmp/docker-ctx
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
     PIP_CERT=/etc/ssl/certs/ca-certificates.crt
@@ -75,14 +94,16 @@ RUN apt-get update && \
 # actually RUNS and makes every outbound HTTPS call (Shopify/Gemini APIs)
 # at runtime. The pre-hardening single-stage image trusted this
 # CA in the one image that both built and ran, so runtime calls worked;
-# splitting into stages silently dropped that for runtime. Same optional
-# `p[e]m` glob pattern as the builder stage — a no-op on a real cloud
-# deployment where this gitignored, machine-local file doesn't exist.
-COPY docker/ca-bundle.p[e]m /tmp/corporate-ca.pem
-RUN if [ -f /tmp/corporate-ca.pem ]; then \
-      cp /tmp/corporate-ca.pem /usr/local/share/ca-certificates/corporate-ca.crt && \
+# splitting into stages silently dropped that for runtime. Same directory-
+# copy-then-conditional-check pattern as the builder stage — a no-op on a
+# real cloud deployment where this gitignored, machine-local file doesn't
+# exist, and portable to Cloud Build's classic builder (see header comment).
+COPY docker/ /tmp/docker-ctx/
+RUN if [ -f /tmp/docker-ctx/ca-bundle.pem ]; then \
+      cp /tmp/docker-ctx/ca-bundle.pem /usr/local/share/ca-certificates/corporate-ca.crt && \
       update-ca-certificates; \
-    fi
+    fi && \
+    rm -rf /tmp/docker-ctx
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 
