@@ -1,0 +1,26 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "754d95090400cda2577808aed745018f"
+name = "NightShift AI"
+application_url = "https://shopify.dev/apps/default-app-home"
+embedded = true
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+# Matches the exact 7-scope list mandated by Sprint 1 Story 1 AC and
+# app/config.py's `shopify_oauth_scopes` — this file governs what Shopify
+# actually allows to be granted; app/config.py's list only controls what our
+# own /api/v1/auth/shopify route requests. Both must agree, or Shopify grants
+# a subset (or none) of what the app requests, which is exactly what caused
+# "Access denied for products field" during the baseline discovery scan.
+scopes = "read_products,write_products,read_discounts,write_discounts,read_themes,write_themes,read_script_tags,write_script_tags"
+
+[auth]
+redirect_urls = [ "https://shopify.dev/apps/default-app-home/api/auth" ]
+
+[webhooks]
+api_version = "2026-10"
+
+[build]
+include_config_on_deploy = true
+automatically_update_urls_on_dev = true

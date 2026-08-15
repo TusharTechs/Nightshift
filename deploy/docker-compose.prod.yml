@@ -1,0 +1,236 @@
+# NightShift AI — PRODUCTION topology (single GCE VM, e2-medium).
+#
+# This mirrors docker/docker-compose.yml's local-dev topology (same 5
+# services: postgres, redis, core_api, worker, beat) with one addition
+# (`caddy`, for automatic Let's Encrypt TLS) and production hardening:
+#   - restart: unless-stopped everywhere, so a VM reboot or a crashed
+#     container comes back on its own.
+#   - postgres/redis/core_api ports are NOT published to the host at all.
+#     Only `caddy` binds 80/443. Every other service is reachable only over
+#     the compose-internal Docker network (`nightshift_net`). This is a
+#     hard security requirement, not a style choice — see
+#     deploy/gcp-vm-setup.sh's firewall section and deploy/README.md.
+#   - resource limits sized for an e2-medium (2 vCPU / 4 GB RAM — see
+#     deploy/README.md's "VM sizing" section for why this is 2 vCPU, not 4,
+#     despite the shorthand "4 vCPU/4GB" some planning docs used).
+#     `deploy.resources.limits` below requires the Compose V2 CLI
+#     (`docker compose ...`, not the legacy python `docker-compose`) to be
+#     enforced outside Swarm mode; gcp-vm-setup.sh installs Compose V2.
+#   - secrets come from a gitignored `.env` file on the VM, populated at
+#     deploy time from GCP Secret Manager (deploy/secrets-setup.md). Nothing
+#     is hardcoded here — core_api/worker/beat pull the full set via
+#     `env_file: ../.env`; postgres/caddy pull just the couple of vars they
+#     need via `${VAR}` interpolation instead (least privilege).
+#
+# Deploy from the repo root on the VM — the explicit `--env-file .env` is
+# required for `${POSTGRES_PASSWORD}`/`${CADDY_DOMAIN}`/`${CADDY_TLS_EMAIL}`
+# interpolation below to resolve (Compose's automatic `.env` lookup is
+# relative to this file's directory otherwise, not the repo root):
+#   docker compose -f deploy/docker-compose.prod.yml --env-file .env up -d --build
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    # No `env_file:` here on purpose — postgres only needs these three vars,
+    # not the app's full secret set (the Gemini key etc.). They come
+    # from `${POSTGRES_PASSWORD}`, host-side-interpolated from the VM's
+    # `.env` at `docker compose --env-file .env ...` time (see
+    # deploy/README.md's deploy command) — least-privilege over just
+    # reusing `env_file: ../.env` here too.
+    environment:
+      POSTGRES_USER: nightshift
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: nightshift
+    # No `ports:` — Postgres is reachable only from other containers on
+    # nightshift_net. Never expose 5432 to the public internet.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nightshift"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - nightshift_net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    # No `ports:` — same reasoning as postgres above. Never expose 6379.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - nightshift_net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  core_api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    # Same localhost/service-name split as docker/docker-compose.yml: the
+    # shared `.env` keeps `localhost` URLs for any non-container run mode;
+    # inside Compose these three are overridden to the internal Docker
+    # network hostnames. POSTGRES_PASSWORD is read from `.env` (Secret
+    # Manager-populated) rather than hardcoded, unlike the local-dev file's
+    # committed dev-only password.
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nightshift:${POSTGRES_PASSWORD}@postgres:5432/nightshift
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      ENVIRONMENT: production
+    # No `ports:` published to the host — only reachable via `caddy` on the
+    # internal network (see Caddyfile: reverse_proxy core_api:8000).
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - nightshift_net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 896M
+        reservations:
+          cpus: "0.25"
+          memory: 384M
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.workers
+    restart: unless-stopped
+    command: celery -A app.infrastructure.messaging.celery_app worker -Q celery:observation,celery:reasoning,celery:execution,celery:verification,celery:cron -l info
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nightshift:${POSTGRES_PASSWORD}@postgres:5432/nightshift
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      ENVIRONMENT: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - nightshift_net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768M
+        reservations:
+          cpus: "0.25"
+          memory: 384M
+
+  beat:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.workers
+    restart: unless-stopped
+    command: celery -A app.infrastructure.messaging.celery_app beat -l info
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nightshift:${POSTGRES_PASSWORD}@postgres:5432/nightshift
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      ENVIRONMENT: production
+    # `celery beat` is a lone scheduler process with no worker to `inspect
+    # ping` (see docker/Dockerfile.workers' HEALTHCHECK comment) — the image
+    # HEALTHCHECK would just report false-unhealthy here, so disable it for
+    # this one service. `restart: unless-stopped` still recovers a crashed
+    # process.
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - nightshift_net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # No `env_file:` here either (see postgres' comment above) — Caddy only
+    # needs these two vars. CADDY_DOMAIN (e.g. app.nightshift.ai) and
+    # CADDY_TLS_EMAIL (for Let's Encrypt account/renewal notices) come from
+    # `.env` via host-side interpolation — see deploy/secrets-setup.md and
+    # deploy/README.md's DNS step. The domain must already point at this
+    # VM's static external IP before Caddy can complete the ACME HTTP-01
+    # challenge on first boot.
+    environment:
+      CADDY_DOMAIN: ${CADDY_DOMAIN}
+      CADDY_TLS_EMAIL: ${CADDY_TLS_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - core_api
+    networks:
+      - nightshift_net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+
+networks:
+  nightshift_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  # Caddy's own storage: ACME account key + issued certs/keys. Losing this
+  # volume just means Caddy re-issues certs on next boot (rate-limited by
+  # Let's Encrypt, ~50 certs/week/domain), it is not app data — but keep it
+  # persistent anyway so a routine `docker compose up -d` doesn't trigger a
+  # needless reissue.
+  caddy_data:
+  caddy_config:

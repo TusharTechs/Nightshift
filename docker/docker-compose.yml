@@ -1,0 +1,115 @@
+version: "3.9"
+
+# Sprint 1 local development topology.
+# Production targets (Aurora, ElastiCache, EKS, Qdrant Cloud) are out of scope
+# for Sprint 1 per the Hackathon MVP Spec and Feature 1's own "Out-of-Scope Items".
+#
+# FIX (2026-08): postgres image changed from `postgres:16` to
+# `pgvector/pgvector:pg16` — the Sprint 1 migration runs
+# `CREATE EXTENSION IF NOT EXISTS "vector"` for the store_memories table, and
+# that extension isn't bundled with the vanilla Postgres image. Without this,
+# `alembic upgrade head` fails with "extension \"vector\" is not available".
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: nightshift
+      POSTGRES_PASSWORD: nightshift_dev_password
+      POSTGRES_DB: nightshift
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nightshift"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  core_api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    env_file:
+      - ../.env
+    # .env's DATABASE_URL/REDIS_URL/CELERY_* point at `localhost` for native
+    # `shopify app dev` (which runs uvicorn on the host, reaching Postgres/
+    # Redis via their published ports). Inside this container, `localhost`
+    # is the container itself — override with the Compose service hostnames
+    # so the two run modes can share one .env without one breaking the other.
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nightshift:nightshift_dev_password@postgres:5432/nightshift
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.workers
+    # Sprint 2 adds tasks.compile_shift_report on celery:reasoning; Sprint 3
+    # adds tasks.execute_cognitive_task on celery:execution and
+    # tasks.verify_execution on celery:verification
+    # (app/infrastructure/messaging/celery_app.py's task_routes) — without
+    # every one of these queues in -Q, the worker would never pick up that
+    # stage and the pipeline would silently stall after the previous step.
+    command: celery -A app.infrastructure.messaging.celery_app worker -Q celery:observation,celery:reasoning,celery:execution,celery:verification,celery:cron -l info
+    env_file:
+      - ../.env
+    # See core_api's `environment:` comment above — same localhost/service-name split.
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nightshift:nightshift_dev_password@postgres:5432/nightshift
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.workers
+    # Sprint 4: the actual scheduling process — a plain worker (above) never
+    # fires tasks.dispatch_nightly_shifts on its own; `celery beat` is what
+    # reads `celery_app.py`'s `beat_schedule` and enqueues it onto
+    # celery:cron on Settings.shift_schedule_interval_minutes, which `worker`
+    # then picks up and executes like any other queued task. A separate
+    # service (not `-B` embedded in `worker`) so scaling worker replicas
+    # later never risks duplicate schedule firing.
+    command: celery -A app.infrastructure.messaging.celery_app beat -l info
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://nightshift:nightshift_dev_password@postgres:5432/nightshift
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

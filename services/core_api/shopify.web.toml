@@ -1,0 +1,13 @@
+# Tells Shopify CLI this directory is the "backend" process of a two-process
+# app. Shopify CLI injects SERVER_PORT/BACKEND_PORT/PORT (all equal) as the
+# port this process must bind to, plus APP_URL/HOST with the current public
+# tunnel URL — see app/config.py, which reads APP_URL/HOST automatically.
+roles = ["backend"]
+
+# Our OAuth callback path (Sprint 1 Endpoint 2) — overrides the CLI's default
+# assumption so `shopify app config link` / `shopify app dev` register the
+# correct Allowed Redirection URL automatically instead of a guessed one.
+auth_callback_path = ["/api/v1/auth/shopify/callback"]
+
+[commands]
+dev = "./dev.sh"

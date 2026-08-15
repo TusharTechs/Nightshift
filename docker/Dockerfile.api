@@ -1,0 +1,103 @@
+# Multi-arch base (Feature 1 edge case: arm64 vs x86_64 Docker base images)
+#
+# Hardened for production (see deploy/README.md):
+#   - multi-stage build: build toolchain / pip cache never lands in the final
+#     image, only the installed site-packages + app source do.
+#   - the corporate CA bundle (docker/ca-bundle.pem) is trusted in the
+#     builder stage ONLY IF PRESENT (see the `ca-bundle.p[e]m` glob COPY
+#     below — a live, reproduced regression: on a corporate-network dev
+#     machine, Docker's own build-time network egress goes through the same
+#     TLS-intercepting proxy `pip install` needs this bundle for, even
+#     though the host machine's own non-Docker network path does not; a
+#     real cloud build (Cloud Build, a GCE VM building the image directly,
+#     GitHub Actions, etc.) has no such proxy, and the file is
+#     gitignored/machine-local so it's simply absent there — the glob COPY
+#     is a no-op and this step trusts nothing extra) — never baked into the
+#     final image either way.
+#   - runs as a non-root `nightshift` user.
+#   - HEALTHCHECK hits the app's existing GET /health (see app/main.py).
+
+FROM --platform=$BUILDPLATFORM python:3.11-slim AS builder
+
+WORKDIR /srv/core_api
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Build-time only deps (gcc/libpq headers etc. for wheels without prebuilt
+# manylinux binaries) live in this stage and never reach the final image.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Optional corporate CA bundle — the `p[e]m` glob makes this a no-op COPY
+# when the file doesn't exist (a real cloud/CI build) rather than a hard
+# build failure, per this file's own header comment.
+COPY docker/ca-bundle.p[e]m /tmp/corporate-ca.pem
+RUN if [ -f /tmp/corporate-ca.pem ]; then \
+      cp /tmp/corporate-ca.pem /usr/local/share/ca-certificates/corporate-ca.crt && \
+      update-ca-certificates; \
+    fi
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+
+COPY services/core_api/pyproject.toml services/core_api/requirements.txt ./
+
+# Install into a venv (rather than system site-packages) so the whole
+# directory can be copied verbatim into the slim final stage.
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim AS final
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# curl is used only by the HEALTHCHECK below. ca-certificates is the normal
+# public Debian/Mozilla trust store (unrelated to the dropped corporate CA
+# bundle above) — kept for any outbound HTTPS call that consults the system
+# store rather than the `certifi` bundle Python HTTP libraries normally ship
+# with. Both kept minimal/no-recommends.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --system nightshift && \
+    useradd --system --gid nightshift --home-dir /srv/core_api --shell /usr/sbin/nologin nightshift
+
+# Live, reproduced regression: a multi-stage build's ENV/OS-cert-store
+# changes are scoped to the stage that made them — trusting the corporate CA
+# only in `builder` (above) never reaches this `final` stage, which is what
+# actually RUNS and makes every outbound HTTPS call (Shopify/Gemini APIs)
+# at runtime. The pre-hardening single-stage image trusted this
+# CA in the one image that both built and ran, so runtime calls worked;
+# splitting into stages silently dropped that for runtime. Same optional
+# `p[e]m` glob pattern as the builder stage — a no-op on a real cloud
+# deployment where this gitignored, machine-local file doesn't exist.
+COPY docker/ca-bundle.p[e]m /tmp/corporate-ca.pem
+RUN if [ -f /tmp/corporate-ca.pem ]; then \
+      cp /tmp/corporate-ca.pem /usr/local/share/ca-certificates/corporate-ca.crt && \
+      update-ca-certificates; \
+    fi
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR /srv/core_api
+COPY services/core_api ./
+
+RUN chown -R nightshift:nightshift /srv/core_api
+
+USER nightshift
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

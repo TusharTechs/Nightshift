@@ -1,0 +1,11 @@
+# Tells Shopify CLI this directory is the "frontend" process of a two-process
+# app — the one whose tunnel URL becomes the public Application URL that
+# Shopify Admin loads. Shopify CLI injects PORT/FRONTEND_PORT (this process's
+# own port) and BACKEND_PORT (where services/core_api is listening); see
+# next.config.js's rewrites(), which proxies /api/v1/* to BACKEND_PORT so the
+# browser never needs a second public tunnel to reach the backend.
+roles = ["frontend"]
+
+[commands]
+dev = "./dev.sh"
+build = "next build"

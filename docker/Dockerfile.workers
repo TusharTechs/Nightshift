@@ -1,0 +1,122 @@
+# Multi-arch base (Feature 1 edge case: arm64 vs x86_64 Docker base images)
+#
+# Hardened for production (see deploy/README.md) — same rationale as
+# docker/Dockerfile.api:
+#   - multi-stage build, no build toolchain in the final image.
+#   - the corporate CA bundle (docker/ca-bundle.pem) is trusted in the
+#     builder stage ONLY IF PRESENT (see the `ca-bundle.p[e]m` glob COPY
+#     below — a live, reproduced regression: on a corporate-network dev
+#     machine, Docker's own build-time network egress goes through the same
+#     TLS-intercepting proxy `pip install` needs this bundle for, even
+#     though the host machine's own non-Docker network path does not; a
+#     real cloud build (GCE/Cloud Build/GitHub Actions) has no such proxy,
+#     and the file is gitignored/machine-local so it's simply absent there
+#     — the glob COPY is a no-op and this step trusts nothing extra) — never
+#     baked into the final image either way.
+#   - runs as a non-root `nightshift` user.
+#   - no HEALTHCHECK for HTTP (this image runs `celery worker`/`celery beat`,
+#     neither of which serves HTTP). Instead we healthcheck via
+#     `celery inspect ping`, which round-trips a control message through the
+#     broker (Redis) to the worker process itself — a much stronger signal
+#     than "the process didn't crash" (e.g. it also catches a worker that's
+#     alive but wedged/disconnected from its broker). `celery beat` has no
+#     worker to ping, so its Compose service overrides this HEALTHCHECK with
+#     `disable: true` (see deploy/docker-compose.prod.yml) rather than
+#     reporting a false "unhealthy".
+
+FROM --platform=$BUILDPLATFORM python:3.11-slim AS builder
+
+WORKDIR /srv/core_api
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Optional corporate CA bundle — the `p[e]m` glob makes this a no-op COPY
+# when the file doesn't exist (a real cloud/CI build) rather than a hard
+# build failure, per this file's own header comment.
+COPY docker/ca-bundle.p[e]m /tmp/corporate-ca.pem
+RUN if [ -f /tmp/corporate-ca.pem ]; then \
+      cp /tmp/corporate-ca.pem /usr/local/share/ca-certificates/corporate-ca.crt && \
+      update-ca-certificates; \
+    fi
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+
+COPY services/core_api/pyproject.toml services/core_api/requirements.txt ./
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim AS final
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# ca-certificates: the normal public Debian/Mozilla trust store (unrelated
+# to the dropped corporate CA bundle above) — kept for any outbound HTTPS
+# call (Shopify/Gemini APIs) that consults the system store rather
+# than the `certifi` bundle Python HTTP libraries normally ship with.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --system nightshift && \
+    useradd --system --gid nightshift --home-dir /srv/core_api --shell /usr/sbin/nologin nightshift
+
+# Live, reproduced regression: a multi-stage build's ENV/OS-cert-store
+# changes are scoped to the stage that made them — trusting the corporate CA
+# only in `builder` (above) never reaches this `final` stage, which is what
+# actually RUNS `celery worker`/`celery beat` and makes every outbound
+# HTTPS call (Shopify/Gemini APIs) at runtime. The pre-hardening
+# single-stage image trusted this CA in the one image that both built and
+# ran, so runtime calls worked; splitting into stages silently dropped that
+# for runtime. Same optional `p[e]m` glob pattern as the builder stage — a
+# no-op on a real cloud deployment where this gitignored, machine-local
+# file doesn't exist.
+COPY docker/ca-bundle.p[e]m /tmp/corporate-ca.pem
+RUN if [ -f /tmp/corporate-ca.pem ]; then \
+      cp /tmp/corporate-ca.pem /usr/local/share/ca-certificates/corporate-ca.crt && \
+      update-ca-certificates; \
+    fi
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR /srv/core_api
+COPY services/core_api ./
+COPY services/workers ./workers
+# Cloud Run only — docker-compose deployments (local + deploy/docker-
+# compose.prod.yml) override CMD entirely via their own `command:` and never
+# invoke this script. See the script's own header comment for why Cloud Run
+# needs it at all.
+COPY deploy/cloudrun-worker-entrypoint.sh ./cloudrun-worker-entrypoint.sh
+
+RUN chown -R nightshift:nightshift /srv/core_api && \
+    chmod +x ./cloudrun-worker-entrypoint.sh
+
+USER nightshift
+
+# Plain `inspect ping` (no `-d <destination>`) pings whatever worker(s)
+# answer on this queue set and succeeds if any respond. That's precise
+# enough here because deploy/docker-compose.prod.yml runs exactly one
+# `worker` replica — if you ever scale `worker` to N replicas behind the
+# same broker, switch this to `-d celery@$HOSTNAME` so each container only
+# reports its own liveness, not the whole fleet's.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD celery -A app.infrastructure.messaging.celery_app inspect ping --timeout 5 || exit 1
+
+# Full queue list (matches docker/docker-compose.yml and
+# deploy/docker-compose.prod.yml's own `command:` override exactly) — kept
+# complete here too so this image's own default is correct if anyone ever
+# runs it directly without either compose file's override, rather than
+# silently never consuming celery:execution/celery:verification.
+CMD ["celery", "-A", "app.infrastructure.messaging.celery_app", "worker", "-Q", "celery:observation,celery:reasoning,celery:execution,celery:verification,celery:cron", "-l", "info"]

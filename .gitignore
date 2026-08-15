@@ -1,0 +1,35 @@
+# NOTE: no root .gitignore existed in this repo before this deployment work.
+# Added primarily to guarantee `.env` (and other local secrets/artifacts)
+# are never committed — see deploy/secrets-setup.md's warning about the
+# production .env holding live API keys + DB password.
+
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+.venv/
+node_modules/
+.next/
+*.tsbuildinfo
+
+# macOS
+.DS_Store
+
+# Machine-local corporate CA bundle (see docker/Dockerfile.api's own
+# comment) — deliberately absent on any other machine/CI so the optional
+# `ca-bundle.p[e]m` glob COPY in both Dockerfiles is a true no-op there.
+docker/ca-bundle.pem
+
+# Session scratch directories — never real project files.
+_to_delete/
+.ns_stage_tmp/
+.ns_stage_tmp2/
+
+# Personal recording aid for the hackathon demo video — not judge-facing
+# repo content, kept locally only.
+DEMO_VIDEO_SCRIPT.md

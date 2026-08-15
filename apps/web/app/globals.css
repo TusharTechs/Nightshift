@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Sprint 2 Feature 5 UI Spec: "Card Entrance: Staggered fade-in slide-up
+   animation (initial y: 10, opacity: 0 to y: 0, opacity: 1)". The spec's own
+   microinteraction calls for framer-motion, which isn't a dependency of this
+   app (nor is the tRPC data layer it separately calls for) — approved
+   substitution: the same visual effect via a plain CSS keyframe + Tailwind's
+   arbitrary-value utilities, avoiding a new runtime dependency mid-sprint.
+   See CONFLICTS.md item 16. */
+@keyframes issue-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .issue-card-entrance {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}

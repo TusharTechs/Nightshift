@@ -1,0 +1,35 @@
+# Caddy reverse proxy for NightShift AI core_api.
+#
+# Caddy handles automatic Let's Encrypt certificate issuance + renewal for
+# {$CADDY_DOMAIN} with zero extra configuration — this is the entire reason
+# Caddy is in front of core_api instead of exposing uvicorn directly. The
+# domain must have a DNS A/AAAA record pointing at this VM's external IP
+# *before* the container starts, or the ACME HTTP-01 challenge will fail.
+#
+# CADDY_DOMAIN / CADDY_TLS_EMAIL come from the VM's .env file (see
+# deploy/docker-compose.prod.yml and deploy/secrets-setup.md).
+
+{
+	email {$CADDY_TLS_EMAIL}
+}
+
+{$CADDY_DOMAIN} {
+	# core_api is not published to the host at all (see
+	# docker-compose.prod.yml) — this is the only path into it. Caddy
+	# automatically issues/renews the TLS cert for this domain and redirects
+	# plain HTTP (port 80, also used for the ACME HTTP-01 challenge) to
+	# HTTPS — no extra config needed for either.
+	reverse_proxy core_api:8000
+
+	encode gzip
+
+	log {
+		output stdout
+		format console
+	}
+}
+
+# Any request that doesn't match CADDY_DOMAIN's Host header (e.g. someone
+# hitting the VM's bare external IP directly) gets Caddy's default response
+# rather than being routed to core_api — nothing else to configure here,
+# this is intentionally left as the fallback.
