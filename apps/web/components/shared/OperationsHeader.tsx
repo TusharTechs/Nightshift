@@ -1,3 +1,5 @@
+import Image from "next/image";
+
 import { AIActivityBadge, type AIActivityState } from "./AIActivityBadge";
 
 const SPECIALIST_COUNT = 4; // Theme Guardian, Checkout Specialist, Tracking
@@ -62,9 +64,12 @@ export function OperationsHeader({
   return (
     <header className="space-y-3 border-b border-gray-200 pb-4">
       <div className="flex items-center justify-between">
-        <div>
-          <p className="text-lg font-semibold text-gray-900">NightShift AI</p>
-          <p className="text-sm text-gray-500">{shopifyDomain}</p>
+        <div className="flex items-center gap-2">
+          <Image src="/logo.png" alt="" width={28} height={28} priority />
+          <div>
+            <p className="text-lg font-semibold text-gray-900">NightShift AI</p>
+            <p className="text-sm text-gray-500">{shopifyDomain}</p>
+          </div>
         </div>
         <AIActivityBadge state={aiActivityState} />
       </div>
