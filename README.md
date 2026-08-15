@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="apps/web/public/logo.png" alt="NightShift AI logo" width="120" />
+</p>
+
 # NightShift AI
 
 **An autonomous AI workforce that runs Shopify store operations overnight.**
